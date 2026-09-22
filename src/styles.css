@@ -1714,6 +1714,34 @@ html.windows .settings {
   font-size: var(--tiny);
   color: var(--tertiary);
 }
+.provider-save-state {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--tiny);
+  line-height: 1.25;
+  color: var(--tertiary);
+}
+.provider-save-state.busy {
+  color: var(--secondary);
+}
+.provider-save-state.error {
+  color: var(--red);
+}
+.provider-result {
+  min-width: 0;
+  max-width: 230px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: right;
+  line-height: 1.25;
+}
+.provider-key {
+  width: 100%;
+}
+.provider-key .sfield {
+  flex: 1;
+  min-width: 0;
+}
 .provider-head {
   min-height: 48px;
 }

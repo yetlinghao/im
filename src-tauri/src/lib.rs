@@ -122,11 +122,11 @@ fn save_provider(engine: State<'_, Arc<Engine>>, input: ProviderInput) -> Cmd<Ve
     if p.id.is_empty() || !p.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err("provider id must be alphanumeric".into());
     }
-    p.base_url = p.base_url.trim().trim_end_matches('/').to_string();
-    if p.name.trim().is_empty() {
-        p.name = p.id.clone();
-    }
-    p.models.retain(|m| !m.trim().is_empty());
+    p.base_url = llm::normalize_base_url(&p.base_url)?;
+    p.name = p.name.trim().to_string();
+    if p.name.is_empty() { return Err("Provider name is required.".into()); }
+    let mut seen = std::collections::HashSet::new();
+    p.models = p.models.into_iter().map(|m| m.trim().to_string()).filter(|m| !m.is_empty() && seen.insert(m.clone())).collect();
     store.upsert_provider(p.clone()).map_err(err)?;
     if let Some(key) = input.api_key {
         store.set_api_key(&p.id, Some(&key)).map_err(err)?;
@@ -155,7 +155,27 @@ async fn fetch_models(
             None => None,
         },
     };
-    llm::list_models(engine.client(), protocol, base_url.trim(), key.as_deref()).await.map_err(err)
+    let base_url = llm::normalize_base_url(&base_url)?;
+    llm::list_models(engine.client(), protocol, &base_url, key.as_deref()).await.map_err(err)
+}
+
+#[tauri::command]
+async fn probe_provider(
+    engine: State<'_, Arc<Engine>>,
+    protocol: Protocol,
+    base_url: String,
+    api_key: Option<String>,
+    provider_id: Option<String>,
+    model: Option<String>,
+) -> Cmd<llm::ProbeResult> {
+    let key = match api_key.filter(|k| !k.trim().is_empty()) {
+        Some(k) => Some(k),
+        None => match provider_id {
+            Some(id) => engine.store().api_key(&id).map_err(|_| "Unable to read the saved API key.".to_string())?,
+            None => None,
+        },
+    };
+    Ok(llm::probe(engine.client(), protocol, &base_url, key.as_deref(), model.as_deref()).await)
 }
 
 #[tauri::command]
@@ -363,6 +383,7 @@ pub fn run() {
             save_provider,
             delete_provider,
             fetch_models,
+            probe_provider,
             get_settings,
             save_settings,
             data_dir,

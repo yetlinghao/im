@@ -10,6 +10,7 @@ import type {
   Message,
   Protocol,
   ProviderInput,
+  ProviderProbeResult,
   ProviderView,
   Session,
   SessionSummary,
@@ -41,6 +42,13 @@ export interface Backend {
     apiKey?: string,
     providerId?: string,
   ): Promise<string[]>;
+  probeProvider(
+    protocol: Protocol,
+    baseUrl: string,
+    apiKey?: string,
+    providerId?: string,
+    model?: string,
+  ): Promise<ProviderProbeResult>;
 
   getSettings(): Promise<Settings>;
   saveSettings(settings: Settings): Promise<void>;
@@ -133,6 +141,14 @@ async function tauriBackend(): Promise<Backend> {
         providerId: providerId ?? null,
       }),
 
+    probeProvider: (protocol, baseUrl, apiKey, providerId, model) =>
+      invoke("probe_provider", {
+        protocol,
+        baseUrl,
+        apiKey: apiKey ?? null,
+        providerId: providerId ?? null,
+        model: model ?? null,
+      }),
     getSettings: () => invoke("get_settings"),
     saveSettings: (settings) => invoke("save_settings", { settings }),
     dataDir: () => invoke("data_dir"),
@@ -707,6 +723,87 @@ function mockBackend(): Backend {
         : ["gpt-5", "gpt-5-mini", "o4-mini"];
     },
 
+    probeProvider: async (protocol, _baseUrl, apiKey, providerId, model) => {
+      const mode = params.get("probe");
+      const duration = mode === "timeout" ? 1200 : 450;
+      await sleep(duration);
+      const status =
+        mode === "auth"
+          ? 401
+          : mode === "404"
+            ? 404
+            : mode === "rate"
+              ? 429
+              : mode === "unexpected"
+                ? 200
+                : mode === "long" || mode === "error"
+                  ? 500
+                  : null;
+      const errorCategory: ProviderProbeResult["error_category"] =
+        mode === "auth"
+          ? "authentication"
+          : mode === "404"
+            ? "endpoint"
+            : mode === "rate"
+              ? "rate_limited"
+              : mode === "timeout"
+                ? "timeout"
+                : mode === "unexpected"
+                  ? "unexpected_response"
+                  : mode === "long" || mode === "error"
+                    ? "provider"
+                    : null;
+      const fail = errorCategory !== null;
+      const message =
+        mode === "auth"
+          ? "The API key is invalid or lacks permission."
+          : mode === "404"
+            ? "The endpoint path was not found."
+            : mode === "rate"
+              ? "The provider is rate limited or out of quota."
+              : mode === "timeout"
+                ? "The provider request timed out."
+                : mode === "unexpected"
+                  ? "The provider returned an unexpected response for this protocol."
+                  : mode === "key"
+                    ? apiKey?.trim()
+                      ? "Temporary API key sent."
+                      : providerId
+                        ? "Saved API key selected."
+                        : "No API key supplied."
+                    : mode === "long"
+                      ? "The provider rejected the request. " +
+                        "Diagnostic detail. ".repeat(12)
+                      : "The provider rejected the request.";
+      const listed =
+        protocol === "anthropic"
+          ? ["claude-sonnet-4-5", "claude-opus-4-1"]
+          : ["gpt-5", "gpt-5-mini"];
+      return {
+        ok: !fail,
+        phase: model ? "stream" : "models",
+        status,
+        duration_ms: duration + 2,
+        model_count: fail ? null : listed.length,
+        stream_ok: !fail && !!model,
+        error_category: errorCategory,
+        message: fail
+          ? message
+          : mode === "key"
+            ? message
+            : model
+              ? "Streaming test succeeded."
+              : `Connection successful; ${listed.length} models found.`,
+        detail:
+          mode === "timeout"
+            ? "Request timed out"
+            : status === null
+              ? null
+              : `HTTP ${status}`,
+        models_warning: null,
+        models: fail ? null : listed,
+      };
+    },
     getSettings: async () => ({ ...settings }),
     saveSettings: async (s) => {
       settings = { ...s };

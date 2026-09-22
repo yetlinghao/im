@@ -76,6 +76,32 @@ export interface ProviderView extends Provider {
   has_key: boolean;
 }
 
+export type ProbeErrorCategory =
+  | "invalid_url"
+  | "connection"
+  | "tls"
+  | "timeout"
+  | "authentication"
+  | "endpoint"
+  | "rate_limited"
+  | "model_unavailable"
+  | "unexpected_response"
+  | "incomplete_stream"
+  | "provider";
+
+export interface ProviderProbeResult {
+  ok: boolean;
+  phase: "validation" | "models" | "stream";
+  status: number | null;
+  duration_ms: number;
+  model_count: number | null;
+  stream_ok: boolean;
+  error_category: ProbeErrorCategory | null;
+  message: string;
+  detail: string | null;
+  models_warning: string | null;
+  models: string[] | null;
+}
 export interface ProviderInput extends Provider {
   /** undefined leaves the stored key alone; "" clears it. */
   api_key?: string;

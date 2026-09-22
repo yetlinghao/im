@@ -64,6 +64,40 @@ async fn write_sse(sock: &mut tokio::net::TcpStream, events: &[&str]) {
 }
 
 async fn respond(sock: &mut tokio::net::TcpStream, path: &str, head: &str, body: &str) {
+    if let Some(status) = path
+        .strip_prefix("/status/")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|value| value.parse::<u16>().ok())
+    {
+        let body = r#"{"error":{"message":"probe-secret-value rejected"}}"#;
+        let response = format!(
+            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        sock.write_all(response.as_bytes()).await.unwrap();
+        let _ = sock.shutdown().await;
+        return;
+    }
+    if let Some(category) = path
+        .strip_prefix("/stream-error/")
+        .and_then(|rest| rest.split('/').next())
+    {
+        let data = match category {
+            "auth" => r#"{"error":{"type":"authentication_error","code":"invalid_api_key","message":"Incorrect API key: probe-secret-value"}}"#,
+            "rate" => r#"{"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"}}"#,
+            "model" => r#"{"type":"error","error":{"code":"model_not_found","message":"model not found"}}"#,
+            _ => r#"{"error":{"message":"provider overloaded"}}"#,
+        };
+        let event = if path.ends_with("/messages") {
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Too many requests\"}}\n\n".to_string()
+        } else if path.ends_with("/responses") {
+            format!("event: error\ndata: {data}\n\n")
+        } else {
+            format!("data: {data}\n\n")
+        };
+        write_sse(sock, &[event.as_str()]).await;
+        return;
+    }
     match path {
         "/v1/chat/completions" => {
             assert!(head.to_ascii_lowercase().contains("authorization: bearer key-1"));
@@ -84,8 +118,8 @@ async fn respond(sock: &mut tokio::net::TcpStream, path: &str, head: &str, body:
             let lower = head.to_ascii_lowercase();
             assert!(lower.contains("x-api-key: key-1"), "head was: {head}");
             assert!(lower.contains("anthropic-version: 2023-06-01"));
-            assert!(body.contains("\"max_tokens\":8192"));
-            assert!(body.contains("\"system\":\"be terse\""));
+            assert!(body.contains("\"max_tokens\":8192") || body.contains("\"max_tokens\":1"));
+            if body.contains("\"max_tokens\":8192") { assert!(body.contains("\"system\":\"be terse\"")); }
             write_sse(
                 sock,
                 &[
@@ -169,11 +203,54 @@ async fn respond(sock: &mut tokio::net::TcpStream, path: &str, head: &str, body:
                 .unwrap();
             let _ = sock.shutdown().await;
         }
-        "/v1/models" => {
+        "/v1/models" | "/v1/models?limit=1000" => {
             let body = r#"{"object":"list","data":[{"id":"b-model"},{"id":"a-model"}]}"#;
             sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes())
                 .await
                 .unwrap();
+            let _ = sock.shutdown().await;
+        }
+        "/badjson/models" => {
+            let body = r#"{"unexpected":[]}"#;
+            sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        }
+        "/nonjson/models" => {
+            let body = "not-json probe-secret-value";
+            sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        }
+        "/empty/models" => {
+            let body = r#"{"object":"list","data":[]}"#;
+            sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        }
+        "/slow-probe/models" => {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let body = r#"{"object":"list","data":[{"id":"m"}]}"#;
+            sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        }
+        "/stream-timeout/chat/completions" => {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            write_sse(sock, &["data: [DONE]\n\n"]).await;
+        }
+        "/doneonly/chat/completions" => {
+            write_sse(sock, &["data: [DONE]\n\n"]).await;
+        }
+        "/manual/models" => {
+            sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        }
+        "/manual/chat/completions" => {
+            assert!(body.contains("\"max_tokens\":1"));
+            write_sse(sock, &["data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"]).await;
+        }
+        "/incomplete/chat/completions" => {
+            write_sse(sock, &["data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"]).await;
+        }
+        "/secret/chat/completions" => {
+            let body = r#"{"error":{"message":"sensitive-key was rejected"}}"#;
+            sock.write_all(format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             let _ = sock.shutdown().await;
         }
         _ => {
@@ -423,4 +500,192 @@ async fn images_reach_every_protocol_and_are_stored_as_parts() {
         assert!(matches!(saved.messages[1].content, Content::Text(_)));
         assert_eq!(saved.title, "see");
     }
+}
+#[tokio::test]
+async fn provider_probe_streams_each_protocol_and_reports_status() {
+    let base = serve().await;
+    let client = im_lib::llm::http_client();
+    for protocol in [Protocol::Chat, Protocol::Anthropic, Protocol::Responses] {
+        let result = im_lib::llm::probe(&client, protocol, &format!("{base}/v1"), Some("key-1"), Some("m")).await;
+        assert!(result.ok, "{protocol:?}: {} ({:?})", result.message, result.detail);
+        assert!(result.stream_ok);
+        assert_eq!(result.status, Some(200));
+        assert_eq!(result.model_count, Some(2));
+    }
+}
+
+#[tokio::test]
+async fn provider_probe_uses_manual_model_when_models_route_is_missing() {
+    let base = serve().await;
+    let result = im_lib::llm::probe(&im_lib::llm::http_client(), Protocol::Chat, &format!("{base}/manual"), Some("key-1"), Some("custom-model")).await;
+    assert!(result.ok, "{}", result.message);
+    assert!(result.stream_ok);
+    assert_eq!(result.model_count, None);
+    assert!(result.models_warning.as_deref().unwrap().contains("HTTP 404"));
+}
+
+#[tokio::test]
+async fn provider_probe_rejects_incomplete_stream_and_redacts_provider_body() {
+    let base = serve().await;
+    let client = im_lib::llm::http_client();
+    let incomplete = im_lib::llm::probe(&client, Protocol::Chat, &format!("{base}/incomplete"), Some("key-1"), Some("m")).await;
+    assert!(!incomplete.ok);
+    assert_eq!(incomplete.error_category, Some(im_lib::llm::ProbeErrorKind::IncompleteStream));
+
+    let rejected = im_lib::llm::probe(&client, Protocol::Chat, &format!("{base}/secret"), Some("sensitive-key"), Some("m")).await;
+    assert!(!rejected.ok);
+    assert_eq!(rejected.error_category, Some(im_lib::llm::ProbeErrorKind::Authentication));
+    assert!(!rejected.message.contains("sensitive-key"));
+    assert!(!rejected.detail.as_deref().unwrap_or_default().contains("sensitive-key"));
+}
+#[tokio::test]
+async fn provider_probe_rejects_wrong_models_shape_with_status() {
+    let base = serve().await;
+    let result = im_lib::llm::probe(&im_lib::llm::http_client(), Protocol::Chat, &format!("{base}/badjson"), Some("key-1"), None).await;
+    assert!(!result.ok);
+    assert_eq!(result.status, Some(200));
+    assert_eq!(result.error_category, Some(im_lib::llm::ProbeErrorKind::UnexpectedResponse));
+}
+
+#[tokio::test]
+async fn provider_probe_classifies_model_list_http_errors_without_exposing_bodies() {
+    let base = serve().await;
+    let expected = [
+        (401, im_lib::llm::ProbeErrorKind::Authentication),
+        (403, im_lib::llm::ProbeErrorKind::Authentication),
+        (404, im_lib::llm::ProbeErrorKind::Endpoint),
+        (429, im_lib::llm::ProbeErrorKind::RateLimited),
+        (500, im_lib::llm::ProbeErrorKind::Provider),
+    ];
+    for (status, category) in expected {
+        let result = im_lib::llm::probe(
+            &im_lib::llm::http_client(),
+            Protocol::Chat,
+            &format!("{base}/status/{status}"),
+            Some("probe-secret-value"),
+            None,
+        )
+        .await;
+        assert!(!result.ok, "HTTP {status}");
+        assert_eq!(result.status, Some(status));
+        assert_eq!(result.error_category, Some(category));
+        assert!(!result.message.contains("probe-secret-value"));
+        assert!(!result.detail.as_deref().unwrap_or_default().contains("probe-secret-value"));
+    }
+}
+
+#[tokio::test]
+async fn provider_probe_models_shape_errors_and_empty_lists() {
+    let base = serve().await;
+    for path in ["badjson", "nonjson"] {
+        let result = im_lib::llm::probe(
+            &im_lib::llm::http_client(),
+            Protocol::Chat,
+            &format!("{base}/{path}"),
+            Some("probe-secret-value"),
+            None,
+        )
+        .await;
+        assert!(!result.ok, "{path}");
+        assert_eq!(result.status, Some(200));
+        assert_eq!(result.error_category, Some(im_lib::llm::ProbeErrorKind::UnexpectedResponse));
+        assert!(!result.detail.as_deref().unwrap_or_default().contains("probe-secret-value"));
+    }
+
+    let empty = im_lib::llm::probe(
+        &im_lib::llm::http_client(),
+        Protocol::Chat,
+        &format!("{base}/empty"),
+        Some("key-1"),
+        None,
+    )
+    .await;
+    assert!(empty.ok);
+    assert_eq!(empty.model_count, Some(0));
+    assert_eq!(empty.models, Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn provider_probe_classifies_http_200_stream_errors_for_each_protocol() {
+    let base = serve().await;
+    let cases = [
+        ("auth", Protocol::Chat, im_lib::llm::ProbeErrorKind::Authentication),
+        ("rate", Protocol::Anthropic, im_lib::llm::ProbeErrorKind::RateLimited),
+        ("model", Protocol::Responses, im_lib::llm::ProbeErrorKind::ModelUnavailable),
+        ("overloaded", Protocol::Chat, im_lib::llm::ProbeErrorKind::Provider),
+    ];
+    for (category, protocol, expected) in cases {
+        let result = im_lib::llm::probe(
+            &im_lib::llm::http_client(),
+            protocol,
+            &format!("{base}/stream-error/{category}"),
+            Some("probe-secret-value"),
+            Some("manual-model"),
+        )
+        .await;
+        assert!(!result.ok, "{protocol:?} {category}");
+        assert_eq!(result.phase, im_lib::llm::ProbePhase::Stream);
+        assert_eq!(result.status, Some(200));
+        assert_eq!(result.error_category, Some(expected));
+        assert!(!result.message.contains("probe-secret-value"));
+        assert!(!result.detail.as_deref().unwrap_or_default().contains("probe-secret-value"));
+    }
+}
+
+#[tokio::test]
+async fn provider_probe_short_timeout_and_cancellation_do_not_wait_for_probe_deadline() {
+    let base = serve().await;
+    let short_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(40))
+        .build()
+        .unwrap();
+
+    let models_timeout = im_lib::llm::probe(
+        &short_client,
+        Protocol::Chat,
+        &format!("{base}/slow-probe"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(models_timeout.error_category, Some(im_lib::llm::ProbeErrorKind::Timeout));
+
+    let stream_timeout = im_lib::llm::probe(
+        &short_client,
+        Protocol::Chat,
+        &format!("{base}/stream-timeout"),
+        None,
+        Some("manual-model"),
+    )
+    .await;
+    assert_eq!(stream_timeout.error_category, Some(im_lib::llm::ProbeErrorKind::Timeout));
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(40),
+        im_lib::llm::probe(
+            &im_lib::llm::http_client(),
+            Protocol::Chat,
+            &format!("{base}/slow-probe"),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert!(cancelled.is_err(), "dropping the probe future cancels its network request");
+}
+
+#[tokio::test]
+async fn provider_probe_only_done_marker_is_an_incomplete_stream() {
+    let base = serve().await;
+    let result = im_lib::llm::probe(
+        &im_lib::llm::http_client(),
+        Protocol::Chat,
+        &format!("{base}/doneonly"),
+        Some("key-1"),
+        Some("manual-model"),
+    )
+    .await;
+    assert!(!result.ok);
+    assert_eq!(result.status, Some(200));
+    assert_eq!(result.error_category, Some(im_lib::llm::ProbeErrorKind::IncompleteStream));
 }

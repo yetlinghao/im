@@ -11,6 +11,12 @@ import { PROTOCOLS } from "../presets";
 import { prettyShortcut, shortcutFromEvent } from "../shortcut";
 import { type State, store } from "../state";
 import type { Appearance, Protocol, ProviderView } from "../types";
+import {
+  isCurrentProviderProbe,
+  normalizeFetchedModels,
+  resolveProbeCredentials,
+  shouldClearApiKeySnapshot,
+} from "./provider-probe-state";
 
 export function createSettings(backend: Backend): HTMLElement {
   const providersList = h("div", { class: "groups" });
@@ -447,6 +453,36 @@ function idFor(name: string, baseUrl: string): string {
   return id;
 }
 
+function checkedProviderBaseUrl(value: string): string {
+  const input = value.trim();
+  if (!input) throw new Error("Base URL is required.");
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch {
+    throw new Error("Enter a valid URL beginning with http:// or https://.");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("Base URL must use http:// or https://.");
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error(
+      "Remove credentials, query parameters, and fragments from the Base URL.",
+    );
+  }
+  const last = url.pathname
+    .replace(/\/+$/, "")
+    .split("/")
+    .at(-1)
+    ?.toLowerCase();
+  if (["models", "messages", "responses", "completions"].includes(last ?? "")) {
+    throw new Error(
+      "Enter the API base URL (for example, ending in /v1), not an endpoint path.",
+    );
+  }
+  return url.toString().replace(/\/+$/, "");
+}
+
 function providerCard(
   initial: ProviderView,
   backend: Backend,
@@ -461,6 +497,10 @@ function providerCard(
     spellcheck: false,
   }) as HTMLInputElement;
   const id = h("div", { class: "provider-id" }, p.id);
+  const saveStatus = h("span", {
+    class: "provider-save-state",
+    "aria-live": "polite",
+  });
   const protocol = h(
     "select",
     { class: "popup" },
@@ -486,6 +526,13 @@ function providerCard(
     autocomplete: "off",
     spellcheck: false,
   }) as HTMLInputElement;
+  const clearKey = tbtn("Clear", () => {
+    key.value = "";
+    pendingApiKey = { value: "", version: ++apiKeyVersion };
+    void save("");
+  });
+  clearKey.title = "Clear the saved API key";
+  clearKey.hidden = !p.has_key;
   const models = h("textarea", {
     class: "sfield area mono",
     rows: rowsFor(p.models.length),
@@ -493,8 +540,14 @@ function providerCard(
     spellcheck: false,
     value: p.models.join("\n"),
   }) as HTMLTextAreaElement;
-  const count = h("span", { class: "srow-value" });
+  const count = h("span", {
+    class: "srow-value provider-result",
+    "aria-live": "polite",
+  });
   const fetchBtn = tbtn("Fetch", () => void fetchModels());
+  const testBtn = tbtn("Test", () => void testProvider());
+  testBtn.title =
+    "Checks the model list and, when a model is configured, sends a one-token streaming request that may incur a small provider charge.";
   const endpoint = h("div", { class: "srow-note mono end" });
 
   const modelList = () => [
@@ -515,69 +568,233 @@ function providerCard(
     );
   const paintEndpoint = () => {
     const proto = PROTOCOLS.find((x) => x.value === protocol.value);
-    endpoint.textContent =
-      proto && baseUrl.value.trim()
-        ? `${baseUrl.value.trim().replace(/\/+$/, "")}${proto.path}`
-        : "";
-  };
-
-  // A draft becomes real on its first save; until it has a name (or a URL to
-  // name it after) nothing is written.
-  const save = async (apiKey?: string) => {
-    if (isDraft() && !name.value.trim() && !baseUrl.value.trim()) return;
-    const creating = isDraft();
-    const pid = creating
-      ? idFor(name.value.trim(), baseUrl.value.trim())
-      : p.id;
     try {
-      const providers = await backend.saveProvider({
-        id: pid,
-        name: name.value.trim() || pid,
-        protocol: protocol.value as Protocol,
-        base_url: baseUrl.value.trim(),
-        models: modelList(),
-        api_key: apiKey,
-      });
-      if (creating) {
-        p = providers.find((x) => x.id === pid) ?? { ...p, id: pid };
-        id.textContent = pid;
-        el.classList.remove("draft");
-        footBtn.textContent = "Remove Provider…";
-        hooks.created(pid, card);
-      }
-      store.set({ providers });
-      if (creating && !store.state.draft) {
-        const first = providers.find((x) => x.id === pid);
-        if (first)
-          store.set({
-            draft: { providerId: first.id, model: first.models[0] ?? "" },
-          });
-      }
-    } catch (e) {
-      say(String(e), true);
+      endpoint.textContent = proto
+        ? `${checkedProviderBaseUrl(baseUrl.value)}${proto.path}`
+        : "";
+    } catch {
+      endpoint.textContent = "";
     }
   };
+  let saveSequence = 0;
+  let saveQueue: Promise<void> = Promise.resolve();
+  let feedbackTimer = 0;
+  let pendingProviderId: string | null = null;
+  let apiKeyVersion = 0;
+  let pendingApiKey: { value: string; version: number } | null = null;
+  const setSaveStatus = (
+    text: string,
+    tone: "busy" | "saved" | "error" | "" = "",
+  ) => {
+    window.clearTimeout(feedbackTimer);
+    saveStatus.textContent = text;
+    saveStatus.className = `provider-save-state${tone ? ` ${tone}` : ""}`;
+    saveStatus.title = tone === "error" ? text : "";
+  };
 
+  // A draft becomes real only after both required fields validate. Saves are
+  // serialized per card so a slow earlier response cannot overwrite a newer edit.
+  const save = (apiKey?: string): Promise<void> => {
+    const sequence = ++saveSequence;
+    const keyToSave = apiKey ?? pendingApiKey?.value;
+    const keyVersion = pendingApiKey?.version;
+    if (!name.value.trim()) {
+      setSaveStatus("Provider name is required.", "error");
+      return Promise.resolve();
+    }
+    let normalizedUrl: string;
+    try {
+      normalizedUrl = checkedProviderBaseUrl(baseUrl.value);
+    } catch (error) {
+      setSaveStatus(
+        error instanceof Error ? error.message : "Invalid Base URL.",
+        "error",
+      );
+      return Promise.resolve();
+    }
+    const creating = isDraft();
+    const pid = creating
+      ? (pendingProviderId ?? idFor(name.value.trim(), normalizedUrl))
+      : p.id;
+    if (creating) pendingProviderId = pid;
+    const input = {
+      id: pid,
+      name: name.value.trim(),
+      protocol: protocol.value as Protocol,
+      base_url: normalizedUrl,
+      models: modelList(),
+      api_key: keyToSave,
+    };
+    setSaveStatus("Saving…", "busy");
+    const task = saveQueue.then(async () => {
+      try {
+        const providers = await backend.saveProvider(input);
+        if (sequence !== saveSequence) return;
+        const saved = providers.find((x) => x.id === pid);
+        if (saved) p = saved;
+        if (creating && saved) {
+          id.textContent = saved.id;
+          el.classList.remove("draft");
+          footBtn.textContent = "Remove Provider…";
+          pendingProviderId = null;
+          hooks.created(pid, card);
+        }
+        if (shouldClearApiKeySnapshot(pendingApiKey, keyVersion)) {
+          pendingApiKey = null;
+        }
+        store.set({ providers });
+        if (creating && saved && !store.state.draft) {
+          store.set({
+            draft: { providerId: saved.id, model: saved.models[0] ?? "" },
+          });
+        }
+        setSaveStatus("Saved", "saved");
+        const savedSequence = sequence;
+        feedbackTimer = window.setTimeout(() => {
+          if (savedSequence === saveSequence) setSaveStatus("");
+        }, 1800);
+      } catch {
+        if (sequence !== saveSequence) return;
+        if (creating) pendingProviderId = null;
+        setSaveStatus("Save failed. Check the fields and try again.", "error");
+        const failedSequence = sequence;
+        feedbackTimer = window.setTimeout(() => {
+          if (failedSequence === saveSequence) setSaveStatus("");
+        }, 2500);
+      }
+    });
+    saveQueue = task.catch(() => undefined);
+    return task;
+  };
+
+  let probeSequence = 0;
+  const isCurrentSettingsCard = () =>
+    el.isConnected && store.state.view === "settings";
   const fetchModels = async () => {
+    let normalizedUrl: string;
+    try {
+      normalizedUrl = checkedProviderBaseUrl(baseUrl.value);
+    } catch (error) {
+      say(error instanceof Error ? error.message : "Invalid Base URL.", true);
+      return;
+    }
     fetchBtn.disabled = true;
+    testBtn.disabled = true;
     say("Fetching…");
     try {
       const ids = await backend.fetchModels(
         protocol.value as Protocol,
-        baseUrl.value.trim(),
+        normalizedUrl,
         key.value.trim() || undefined,
         isDraft() ? undefined : p.id,
       );
-      if (ids.length) {
-        models.value = ids.join("\n");
-        models.rows = rowsFor(ids.length);
+      if (!isCurrentSettingsCard()) return;
+      const received = normalizeFetchedModels(ids);
+      if (received.length) {
+        models.value = received.join("\n");
+        models.rows = rowsFor(received.length);
         await save();
+        if (!isCurrentSettingsCard()) return;
+        say(`${modelList().length} models found.`);
+      } else {
+        say("No models were returned.", true);
       }
-      paintCount();
-    } catch (e) {
-      say(String(e), true);
+    } catch {
+      if (isCurrentSettingsCard())
+        say("Couldn't fetch models. Check the URL, key, and protocol.", true);
     } finally {
-      fetchBtn.disabled = false;
+      if (isCurrentSettingsCard()) {
+        fetchBtn.disabled = false;
+        testBtn.disabled = false;
+      }
+    }
+  };
+
+  const testProvider = async () => {
+    let normalizedUrl: string;
+    try {
+      normalizedUrl = checkedProviderBaseUrl(baseUrl.value);
+    } catch (error) {
+      say(error instanceof Error ? error.message : "Invalid Base URL.", true);
+      return;
+    }
+    const candidates = modelList();
+    const configuredModel =
+      store.state.draft?.providerId === p.id
+        ? store.state.draft.model
+        : store.state.settings.default_provider_id === p.id
+          ? store.state.settings.default_model
+          : undefined;
+    const model = candidates.includes(configuredModel ?? "")
+      ? configuredModel
+      : candidates[0];
+    const sequence = ++probeSequence;
+    fetchBtn.disabled = true;
+    testBtn.disabled = true;
+    say(model ? `Testing ${model}…` : "Checking connection…");
+    try {
+      const credentials = resolveProbeCredentials(
+        pendingApiKey,
+        key.value,
+        p.id,
+        isDraft(),
+      );
+      const result = await backend.probeProvider(
+        protocol.value as Protocol,
+        normalizedUrl,
+        credentials.apiKey,
+        credentials.providerId,
+        model,
+      );
+      if (
+        !isCurrentProviderProbe(
+          sequence,
+          probeSequence,
+          el.isConnected,
+          store.state.view,
+        )
+      )
+        return;
+      const metrics = [
+        result.phase,
+        result.status === null ? null : `HTTP ${result.status}`,
+        `${result.duration_ms} ms`,
+        result.model_count === null ? null : `${result.model_count} models`,
+        result.stream_ok ? "Stream OK" : null,
+      ];
+      const detail = result.detail?.replace(/^HTTP \d+:?\s*/, "");
+      const summary = [
+        result.message,
+        ...metrics,
+        detail,
+        result.models_warning,
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      say(summary, !result.ok);
+    } catch {
+      if (
+        isCurrentProviderProbe(
+          sequence,
+          probeSequence,
+          el.isConnected,
+          store.state.view,
+        )
+      ) {
+        say("Test failed before a result was returned.", true);
+      }
+    } finally {
+      if (
+        isCurrentProviderProbe(
+          sequence,
+          probeSequence,
+          el.isConnected,
+          store.state.view,
+        )
+      ) {
+        fetchBtn.disabled = false;
+        testBtn.disabled = false;
+      }
     }
   };
 
@@ -589,15 +806,19 @@ function providerCard(
   baseUrl.addEventListener("input", paintEndpoint);
   baseUrl.addEventListener("change", () => void save());
   key.addEventListener("change", () => {
-    const k = key.value.trim();
-    if (!k) return;
+    const value = key.value.trim();
+    if (!value) {
+      pendingApiKey = null;
+      return;
+    }
+    pendingApiKey = { value, version: ++apiKeyVersion };
     key.value = "";
-    void save(k);
+    void save(value);
   });
   models.addEventListener("input", paintCount);
   models.addEventListener("change", () => {
     models.rows = rowsFor(modelList().length);
-    save();
+    void save();
   });
   paintEndpoint();
   paintCount();
@@ -630,7 +851,7 @@ function providerCard(
     h(
       "div",
       { class: "srow provider-head" },
-      h("div", { class: "srow-label" }, name, id),
+      h("div", { class: "srow-label" }, name, id, saveStatus),
       h("div", { class: "srow-control" }, protocol),
     ),
     h(
@@ -639,12 +860,15 @@ function providerCard(
       h("div", { class: "srow-label" }, "Base URL"),
       h("div", { class: "srow-control stack" }, baseUrl, endpoint),
     ),
-    srow("API key", key),
+    srow(
+      "API key",
+      h("div", { class: "srow-inline provider-key" }, key, clearKey),
+    ),
     h(
       "div",
       { class: "srow has-block" },
       h("div", { class: "srow-label" }, "Models"),
-      h("div", { class: "srow-control srow-inline" }, count, fetchBtn),
+      h("div", { class: "srow-control srow-inline" }, count, testBtn, fetchBtn),
       h("div", { class: "srow-block" }, models),
     ),
     h("div", { class: "srow provider-foot" }, footBtn),
@@ -662,6 +886,7 @@ function providerCard(
         models.rows = rowsFor(next.models.length);
       }
       key.placeholder = next.has_key ? "••••••••" : "Not set";
+      clearKey.hidden = !next.has_key;
       id.textContent = next.id;
       paintEndpoint();
       paintCount();
@@ -673,7 +898,6 @@ function providerCard(
   };
   return card;
 }
-
 function rowsFor(n: number): number {
   return Math.min(10, Math.max(2, n + 1));
 }

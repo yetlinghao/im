@@ -218,6 +218,7 @@ mod tests {
                 Message::user("more", "t".into()),
             ],
             max_tokens: 4096,
+            probe: false,
         };
         let r = build(&reqwest::Client::new(), &req).build().unwrap();
         assert_eq!(r.url().as_str(), "http://h/v1/messages");

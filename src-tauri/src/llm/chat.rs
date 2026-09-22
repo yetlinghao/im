@@ -20,12 +20,13 @@ pub fn build(client: &reqwest::Client, req: &TurnRequest) -> reqwest::RequestBui
         _ => json!({ "role": role, "content": m.content }),
     }));
 
-    let body = json!({
+    let mut body = json!({
         "model": req.model,
         "messages": messages,
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    if req.probe { body["max_tokens"] = json!(req.max_tokens); }
 
     let mut rb = client
         .post(join(&req.base_url, "chat/completions"))
@@ -184,6 +185,7 @@ mod tests {
             system: Some("sys".into()),
             messages: vec![Message::user("hi", "t".into())],
             max_tokens: 100,
+            probe: false,
         };
         let r = build(&reqwest::Client::new(), &req).build().unwrap();
         assert_eq!(r.url().as_str(), "http://h/v1/chat/completions");
@@ -207,6 +209,7 @@ mod tests {
             system: None,
             messages: vec![Message::user("hi", "t".into()), reply.clone(), Message::user("more", "t".into())],
             max_tokens: 100,
+            probe: false,
         };
         let r = build(&reqwest::Client::new(), &req).build().unwrap();
         let body: Value = serde_json::from_slice(r.body().unwrap().as_bytes().unwrap()).unwrap();

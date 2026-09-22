@@ -204,6 +204,7 @@ impl Engine {
             system: session.system.clone(),
             messages: session.messages.clone(),
             max_tokens: settings.max_tokens,
+            probe: false,
         };
 
         let started = Instant::now();
@@ -231,7 +232,7 @@ impl Engine {
         let latency_ms = started.elapsed().as_millis() as u64;
         let thinking_ms = acc.first_reasoning.map(|r| acc.first_text.unwrap_or_else(Instant::now).duration_since(r).as_millis() as u64);
         let (finish_reason, error) = match &result {
-            Ok(()) => (acc.finish_reason.take().or_else(|| Some("stop".into())), None),
+            Ok(_) => (acc.finish_reason.take().or_else(|| Some("stop".into())), None),
             Err(LlmError::Cancelled) => (Some("cancelled".into()), None),
             Err(e) => (Some("error".into()), Some(e.to_string())),
         };

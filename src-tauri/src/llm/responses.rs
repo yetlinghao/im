@@ -34,6 +34,7 @@ pub fn build(client: &reqwest::Client, req: &TurnRequest) -> reqwest::RequestBui
         "stream": true,
         "store": false,
     });
+    if req.probe { body["max_output_tokens"] = json!(req.max_tokens); }
     if let Some(system) = req.system.as_deref().filter(|s| !s.trim().is_empty()) {
         body["instructions"] = Value::String(system.to_string());
     }
@@ -197,6 +198,7 @@ mod tests {
             system: None,
             messages: vec![Message::user("hi", "t".into())],
             max_tokens: 100,
+            probe: false,
         };
         let r = build(&reqwest::Client::new(), &req).build().unwrap();
         assert_eq!(r.url().as_str(), "http://h/v1/responses");
