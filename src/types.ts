@@ -40,6 +40,8 @@ export interface Message {
   created_at?: string;
   /** Chat-completions field name, so a stored trajectory replays as-is. */
   reasoning_content?: string;
+  /** Anthropic's signed thinking blocks, verbatim; the backend sends them back. */
+  thinking_blocks?: unknown[];
   meta?: TurnMeta;
 }
 

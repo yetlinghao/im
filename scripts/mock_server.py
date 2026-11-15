@@ -53,6 +53,10 @@ def images_in(content):
     return sum(1 for p in content if isinstance(p, dict) and p.get("type") in ("image_url", "image", "input_image"))
 
 
+def thinking_in(content):
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in ("thinking", "redacted_thinking") for p in content)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -91,10 +95,10 @@ class Handler(BaseHTTPRequestHandler):
         msgs = body.get("messages") or body.get("input") or []
         last = text_of(msgs[-1].get("content", "")) if msgs and isinstance(msgs[-1], dict) else ""
         # One line per request showing what came back to us: role, chars, whether
-        # earlier replies carried their reasoning_content (thinking models need it),
+        # earlier replies carried their reasoning (`reasoning_content`, or Anthropic thinking blocks),
         # and `+Ni` for N image parts.
         shape = " ".join(
-            f"{m.get('role','?')[0]}{len(text_of(m.get('content','')))}{'+r' if m.get('reasoning_content') else ''}{'+%di' % images_in(m.get('content')) if images_in(m.get('content')) else ''}"
+            f"{m.get('role','?')[0]}{len(text_of(m.get('content','')))}{'+r' if m.get('reasoning_content') or thinking_in(m.get('content')) else ''}{'+%di' % images_in(m.get('content')) if images_in(m.get('content')) else ''}"
             for m in msgs
             if isinstance(m, dict)
         )
@@ -124,6 +128,7 @@ class Handler(BaseHTTPRequestHandler):
             for c in chunks(REASONING):
                 self._event({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": c}}, "content_block_delta")
                 time.sleep(delay)
+            self._event({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "mock-sig"}}, "content_block_delta")
             self._event({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}, "content_block_start")
             for c in chunks(REPLY):
                 self._event({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": c}}, "content_block_delta")

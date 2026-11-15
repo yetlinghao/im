@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 
 use super::{data_url, join, turns, Parsed, StreamEvent, TurnRequest};
-use crate::model::{Content, Part, Usage};
+use crate::model::{Content, Message, Part, Protocol, Usage};
 use crate::sse::SseEvent;
 
 pub const VERSION: &str = "2023-06-01";
@@ -27,9 +27,30 @@ fn content(c: &Content) -> Value {
     }
 }
 
+/// An earlier reply goes back with its signed thinking blocks in front of the
+/// text, so models that keep prior thinking in context see it. Only when it
+/// was produced over this protocol by the model we are calling now: signatures
+/// are model-bound, and a thinking block without a valid one is a 400.
+fn assistant_content(m: &Message, model: &str) -> Value {
+    let text = m.content.text();
+    let same_model = m.meta.as_ref().is_some_and(|t| t.protocol == Protocol::Anthropic && t.model == model);
+    match &m.thinking_blocks {
+        Some(blocks) if same_model && !blocks.is_empty() && !text.is_empty() => {
+            let mut parts = blocks.clone();
+            parts.push(json!({ "type": "text", "text": text }));
+            Value::Array(parts)
+        }
+        _ => content(&m.content),
+    }
+}
+
 pub fn build(client: &reqwest::Client, req: &TurnRequest) -> reqwest::RequestBuilder {
-    let messages: Vec<Value> =
-        turns(&req.messages).map(|(role, m)| json!({ "role": role, "content": content(&m.content) })).collect();
+    let messages: Vec<Value> = turns(&req.messages)
+        .map(|(role, m)| {
+            let content = if role == "assistant" { assistant_content(m, &req.model) } else { content(&m.content) };
+            json!({ "role": role, "content": content })
+        })
+        .collect();
 
     let mut body = json!({
         "model": req.model,
@@ -104,7 +125,20 @@ pub fn parse(ev: &SseEvent) -> Parsed {
                             out.push(StreamEvent::Reasoning(t.to_string()));
                         }
                     }
-                    _ => {} // signature_delta, input_json_delta (tools) — not ours
+                    Some("signature_delta") => {
+                        if let Some(s) = delta.get("signature").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                            out.push(StreamEvent::Signature(s.to_string()));
+                        }
+                    }
+                    _ => {} // input_json_delta (tools) — not ours
+                }
+            }
+        }
+        "content_block_start" => {
+            let block = v.get("content_block");
+            if block.and_then(|b| b.get("type")).and_then(Value::as_str) == Some("redacted_thinking") {
+                if let Some(d) = block.and_then(|b| b.get("data")).and_then(Value::as_str) {
+                    out.push(StreamEvent::RedactedThinking(d.to_string()));
                 }
             }
         }
@@ -117,7 +151,7 @@ pub fn parse(ev: &SseEvent) -> Parsed {
                 out.push(StreamEvent::Usage(Usage { output_tokens: u.get("output_tokens").and_then(Value::as_u64), ..Usage::default() }));
             }
         }
-        _ => {} // ping, content_block_start/stop, message_stop
+        _ => {} // ping, content_block_stop, message_stop
     }
     Ok(out)
 }
@@ -140,6 +174,14 @@ pub fn parse_complete(body: &str) -> Result<Vec<StreamEvent>, String> {
                 if let Some(t) = block.get("thinking").and_then(Value::as_str) {
                     out.push(StreamEvent::Reasoning(t.to_string()));
                 }
+                if let Some(s) = block.get("signature").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    out.push(StreamEvent::Signature(s.to_string()));
+                }
+            }
+            Some("redacted_thinking") => {
+                if let Some(d) = block.get("data").and_then(Value::as_str) {
+                    out.push(StreamEvent::RedactedThinking(d.to_string()));
+                }
             }
             _ => {}
         }
@@ -154,7 +196,7 @@ pub fn parse_complete(body: &str) -> Result<Vec<StreamEvent>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Message, Protocol, Role};
+    use crate::model::{Role, TurnMeta};
 
     fn ev(event: &str, data: &str) -> SseEvent {
         SseEvent { event: Some(event.to_string()), data: data.to_string() }
@@ -185,7 +227,7 @@ mod tests {
         let th = parse(&ev("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me"}}"#)).unwrap();
         assert_eq!(th, vec![StreamEvent::Reasoning("Let me".into())]);
         let sig = parse(&ev("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#)).unwrap();
-        assert!(sig.is_empty());
+        assert_eq!(sig, vec![StreamEvent::Signature("abc".into())]);
 
         let tx = parse(&ev("content_block_delta", r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}"#)).unwrap();
         assert_eq!(tx, vec![StreamEvent::Text("Hello".into())]);
@@ -214,7 +256,7 @@ mod tests {
             system: Some("sys".into()),
             messages: vec![
                 Message::user("hi", "t".into()),
-                Message { role: Role::Assistant, content: "yo".into(), created_at: None, reasoning_content: None, meta: None },
+                Message { role: Role::Assistant, content: "yo".into(), created_at: None, reasoning_content: None, thinking_blocks: None, meta: None },
                 Message::user("more", "t".into()),
             ],
             max_tokens: 4096,
@@ -229,6 +271,60 @@ mod tests {
         assert_eq!(body["messages"].as_array().unwrap().len(), 3);
         assert_eq!(body["messages"][1]["role"], "assistant");
         assert!(body["messages"].as_array().unwrap().iter().all(|m| m["role"] != "system"));
+    }
+
+    #[test]
+    fn redacted_thinking_block() {
+        let r = parse(&ev("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"EmwK"}}"#)).unwrap();
+        assert_eq!(r, vec![StreamEvent::RedactedThinking("EmwK".into())]);
+    }
+
+    fn reply(model: &str, blocks: Option<Vec<Value>>, text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: text.into(),
+            created_at: None,
+            reasoning_content: Some("why".into()),
+            thinking_blocks: blocks,
+            meta: Some(TurnMeta { protocol: Protocol::Anthropic, model: model.into(), ..TurnMeta::default() }),
+        }
+    }
+
+    fn sent_assistant(m: Message) -> Value {
+        let req = TurnRequest {
+            protocol: Protocol::Anthropic,
+            base_url: "http://h/v1".into(),
+            api_key: None,
+            model: "claude".into(),
+            system: None,
+            messages: vec![Message::user("hi", "t".into()), m, Message::user("more", "t".into())],
+            max_tokens: 4096,
+        };
+        let r = build(&reqwest::Client::new(), &req).build().unwrap();
+        let body: Value = serde_json::from_slice(r.body().unwrap().as_bytes().unwrap()).unwrap();
+        body["messages"][1]["content"].clone()
+    }
+
+    #[test]
+    fn signed_thinking_is_replayed_for_the_same_model_only() {
+        let blocks = vec![json!({ "type": "thinking", "thinking": "why", "signature": "s" }), json!({ "type": "redacted_thinking", "data": "d" })];
+        assert_eq!(
+            sent_assistant(reply("claude", Some(blocks.clone()), "yo")),
+            json!([blocks[0], blocks[1], { "type": "text", "text": "yo" }])
+        );
+        // Another model's signature is useless at best; an empty reply can't carry a text block.
+        assert_eq!(sent_assistant(reply("other", Some(blocks.clone()), "yo")), "yo");
+        assert_eq!(sent_assistant(reply("claude", Some(blocks), "")), "");
+        assert_eq!(sent_assistant(reply("claude", None, "yo")), "yo");
+    }
+
+    #[test]
+    fn complete_object_keeps_signatures() {
+        let out = parse_complete(r#"{"type":"message","content":[{"type":"thinking","thinking":"hm","signature":"s"},{"type":"redacted_thinking","data":"d"},{"type":"text","text":"Hi"}],"stop_reason":"end_turn"}"#).unwrap();
+        assert_eq!(
+            out[..4],
+            [StreamEvent::Reasoning("hm".into()), StreamEvent::Signature("s".into()), StreamEvent::RedactedThinking("d".into()), StreamEvent::Text("Hi".into())]
+        );
     }
 
     #[test]

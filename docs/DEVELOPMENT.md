@@ -169,7 +169,10 @@ Design rules for the schema:
   is the provider's own value (`stop`, `end_turn`, `length`, …) or `cancelled`
   / `error` when the turn did not finish normally; `reasoning_content` is whatever the
   stream carried (Anthropic thinking, DeepSeek `reasoning_content`, Responses
-  reasoning summaries), stored verbatim. `usage.input_tokens` is the whole
+  reasoning summaries), stored verbatim. Anthropic's signed thinking blocks
+  are also kept as-is in `thinking_blocks` (`[{"type": "thinking", "thinking",
+  "signature"}, {"type": "redacted_thinking", "data"}]`, LiteLLM's field name)
+  so they can be sent back. `usage.input_tokens` is the whole
   prompt for that call (Anthropic's cache reads and writes folded back in) and
   `cached_input_tokens` the part the provider served from its prompt cache;
   `ttft_ms` is time to the first streamed token, `latency_ms` the whole call.
@@ -187,7 +190,7 @@ Design rules for the schema:
 | `protocol` | Request | Reasoning captured from | Usage from |
 |---|---|---|---|
 | `chat` | `POST {base_url}/chat/completions`, `stream: true`, `stream_options.include_usage`; earlier replies are replayed with their `reasoning_content`; image parts go through unchanged | `delta.reasoning_content` / `delta.reasoning` | final `usage` chunk |
-| `anthropic` | `POST {base_url}/messages`, `stream: true`, `max_tokens` (8192); images become `{"type": "image", "source": {"type": "base64", "media_type", "data"}}` blocks | `thinking_delta` | `message_start` + `message_delta` |
+| `anthropic` | `POST {base_url}/messages`, `stream: true`, `max_tokens` (8192); images become `{"type": "image", "source": {"type": "base64", "media_type", "data"}}` blocks; earlier replies from the same model are sent back as their `thinking_blocks` + a text block | `thinking_delta` (+ `signature_delta`, `redacted_thinking`) | `message_start` + `message_delta` |
 | `responses` | `POST {base_url}/responses`, `stream: true`, `store: false`; user images become `input_text` / `input_image` parts | `response.reasoning_summary_text.delta` | `response.completed` |
 
 Model lists come from `GET {base_url}/models` for all three. Requests carry

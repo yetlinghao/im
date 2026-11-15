@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn earlier_reasoning_is_replayed() {
-        let mut reply = Message { role: Role::Assistant, content: "yo".into(), created_at: None, reasoning_content: Some("why".into()), meta: None };
+        let mut reply = Message { role: Role::Assistant, content: "yo".into(), created_at: None, reasoning_content: Some("why".into()), thinking_blocks: None, meta: None };
         let req = TurnRequest {
             protocol: Protocol::Chat,
             base_url: "http://h/v1".into(),
