@@ -187,11 +187,17 @@ end (cancelled turns keep partial text with `finish_reason: "cancelled"`).
   server logs `+Ni` per image part.
 - Reasoning is captured passively from whatever the stream carries. Don't send
   request-side thinking/sampling parameters — gateways reject unknown fields.
-  The one thing we do send back: on the `chat` protocol, earlier assistant
-  turns carry their stored `reasoning_content` (DeepSeek/MiMo/Kimi-style
-  thinking models need it to continue a trajectory). Anthropic and Responses
-  get `{role, content}` only — their thinking blocks need signatures/ids we
-  don't keep.
+  What we do send back: on the `chat` protocol, earlier assistant turns carry
+  their stored `reasoning_content` (DeepSeek/MiMo/Kimi-style thinking models
+  need it to continue a trajectory). On `anthropic`, the signed thinking
+  blocks are kept verbatim in `thinking_blocks` (`signature_delta` closes the
+  block whose text came before it; `redacted_thinking` is kept as its `data`)
+  and an earlier reply goes back as those blocks + its text — but only when
+  that reply came from the same model over `anthropic` and has text: a
+  thinking block without a valid signature is a 400, and another model's
+  signature gets the thinking silently dropped. A block cut off before its
+  signature (cancelled) is not kept. Responses gets `{role, content}` only —
+  its reasoning items need ids we don't keep.
 - Request/response bodies are `serde_json::Value`; no per-provider structs.
   Header names arrive title-cased from reqwest 0.13 — compare case-insensitively.
 - The UI is quiet: nothing persistent that isn't content. Metadata is on hover

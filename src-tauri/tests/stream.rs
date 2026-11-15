@@ -86,11 +86,26 @@ async fn respond(sock: &mut tokio::net::TcpStream, path: &str, head: &str, body:
             assert!(lower.contains("anthropic-version: 2023-06-01"));
             assert!(body.contains("\"max_tokens\":8192"));
             assert!(body.contains("\"system\":\"be terse\""));
+            // A follow-up turn sends the earlier reply back with its signed thinking.
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            if let Some(prev) = v["messages"].as_array().unwrap().iter().find(|m| m["role"] == "assistant") {
+                assert_eq!(
+                    prev["content"],
+                    serde_json::json!([
+                        { "type": "thinking", "thinking": "hmm", "signature": "sig1" },
+                        { "type": "redacted_thinking", "data": "opaque" },
+                        { "type": "text", "text": "Hi there" },
+                    ]),
+                    "body was: {body}"
+                );
+            }
             write_sse(
                 sock,
                 &[
                     "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}\n\n",
                     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}\n\n",
+                    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig1\"}}\n\n",
+                    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"opaque\"}}\n\n",
                     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi \"}}\n\n",
                     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"there\"}}\n\n",
                     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":7}}\n\n",
@@ -270,10 +285,23 @@ async fn anthropic_and_responses_protocols() {
     let m = message.unwrap();
     assert_eq!(m.content.text(), "Hi there");
     assert_eq!(m.reasoning_content.as_deref(), Some("hmm"));
-    let meta = m.meta.unwrap();
+    assert_eq!(
+        m.thinking_blocks.as_deref().unwrap(),
+        [serde_json::json!({ "type": "thinking", "thinking": "hmm", "signature": "sig1" }), serde_json::json!({ "type": "redacted_thinking", "data": "opaque" })]
+    );
+    let meta = m.meta.as_ref().unwrap();
     assert_eq!(meta.protocol, Protocol::Anthropic);
     assert_eq!(meta.finish_reason.as_deref(), Some("end_turn"));
     assert_eq!((meta.usage.input_tokens, meta.usage.output_tokens), (Some(20), Some(7)));
+    // Second turn: the server asserts the reply went back with its thinking blocks.
+    let TurnEvent::Started { session } = events.lock().unwrap()[0].clone() else { panic!() };
+    let (events, emit) = collect();
+    engine
+        .run_turn(TurnKind::Send { session_id: Some(session.id.clone()), provider_id: "p".into(), model: "m".into(), content: "more".into(), images: vec![] }, emit)
+        .await
+        .unwrap();
+    let TurnEvent::Done { error, .. } = events.lock().unwrap().last().unwrap().clone() else { panic!() };
+    assert!(error.is_none(), "{error:?}");
 
     let (_d2, engine) = engine_with(&base, Protocol::Responses, "v1");
     let (events, emit) = collect();

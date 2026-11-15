@@ -348,6 +348,7 @@ mod tests {
             content: "hi".into(),
             created_at: Some(now_rfc3339()),
             reasoning_content: None,
+            thinking_blocks: None,
             meta: Some(TurnMeta {
                 provider_id: "p1".into(),
                 protocol: Protocol::Chat,

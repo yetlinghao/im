@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::{self, LlmError, StreamEvent, TurnRequest};
@@ -41,7 +42,7 @@ pub enum TurnEvent {
     Done {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        message: Option<Message>,
+        message: Option<Box<Message>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
         updated_at: String,
@@ -214,7 +215,15 @@ impl Engine {
                     acc.first_token(started);
                     acc.first_reasoning.get_or_insert_with(Instant::now);
                     acc.reasoning.push_str(d);
+                    acc.open_thinking.push_str(d);
                     emit(TurnEvent::Reasoning { session_id: session_id.clone(), delta: d.clone() });
+                }
+                StreamEvent::Signature(sig) => {
+                    let thinking = std::mem::take(&mut acc.open_thinking);
+                    acc.thinking_blocks.push(json!({ "type": "thinking", "thinking": thinking, "signature": sig }));
+                }
+                StreamEvent::RedactedThinking(data) => {
+                    acc.thinking_blocks.push(json!({ "type": "redacted_thinking", "data": data }));
                 }
                 StreamEvent::Text(d) => {
                     acc.first_token(started);
@@ -243,6 +252,8 @@ impl Engine {
                 content: Content::Text(std::mem::take(&mut acc.text)),
                 created_at: Some(now_rfc3339()),
                 reasoning_content: Some(std::mem::take(&mut acc.reasoning)).filter(|r| !r.trim().is_empty()),
+                // A block still open (no signature yet, e.g. cancelled mid-thought) is dropped.
+                thinking_blocks: Some(std::mem::take(&mut acc.thinking_blocks)).filter(|b| !b.is_empty()),
                 meta: Some(TurnMeta {
                     provider_id: provider.id.clone(),
                     protocol: provider.protocol,
@@ -273,7 +284,7 @@ impl Engine {
             (None, Err(p)) => Some(format!("saving failed: {p}")),
         };
 
-        emit(TurnEvent::Done { session_id, message, error, updated_at: fresh.updated_at });
+        emit(TurnEvent::Done { session_id, message: message.map(Box::new), error, updated_at: fresh.updated_at });
         Ok(())
     }
 }
@@ -293,6 +304,9 @@ impl Drop for ActiveGuard<'_> {
 struct Accumulator {
     text: String,
     reasoning: String,
+    /// Anthropic thinking text since the last signature.
+    open_thinking: String,
+    thinking_blocks: Vec<Value>,
     usage: Usage,
     finish_reason: Option<String>,
     ttft_ms: Option<u64>,

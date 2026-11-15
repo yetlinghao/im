@@ -164,6 +164,11 @@ pub struct Message {
     /// Named like the chat-completions field so a trajectory replays as-is.
     #[serde(default, alias = "reasoning", skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// Anthropic's signed thinking blocks, verbatim (`{type: "thinking",
+    /// thinking, signature}` / `{type: "redacted_thinking", data}`), so later
+    /// turns can send them back. Same name and shape as LiteLLM's field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_blocks: Option<Vec<serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<TurnMeta>,
 }
@@ -175,6 +180,7 @@ impl Message {
             content: content.into(),
             created_at: Some(now),
             reasoning_content: None,
+            thinking_blocks: None,
             meta: None,
         }
     }

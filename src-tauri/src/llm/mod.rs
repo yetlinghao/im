@@ -19,6 +19,11 @@ use crate::sse::{SseEvent, SseParser};
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     Reasoning(String),
+    /// Anthropic: closes the thinking block whose text arrived as `Reasoning`
+    /// since the previous signature. Without it the block can't be sent back.
+    Signature(String),
+    /// Anthropic `redacted_thinking`: an opaque `data` blob, sent back as-is.
+    RedactedThinking(String),
     Text(String),
     Usage(Usage),
     Finish(Option<String>),
